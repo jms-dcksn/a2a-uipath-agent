@@ -1,0 +1,7 @@
+.env
+.git
+.uipath
+.venv
+__pycache__
+*.pyc
+.DS_Store

@@ -1,7 +1,4 @@
-"""A minimal A2A remote agent server.
-
-This is a skeleton: a working A2A server that accepts a message and replies
-with a canned response. There is no LLM here yet — that gets added later.
+"""A2A remote agent server backed by a UiPath LangChain agent.
 
 Run it:
     uv run server.py
@@ -13,9 +10,17 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
+import secrets
+from collections.abc import Awaitable, Callable, MutableMapping
+from typing import Any, TypedDict
 
+import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 
 from a2a.server.agent_execution.agent_executor import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
@@ -43,13 +48,316 @@ from a2a.types import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency is declared for runtime.
+    load_dotenv = None
 
-class HelloWorldExecutor(AgentExecutor):
-    """The agent's actual logic lives here.
+if load_dotenv:
+    load_dotenv()
 
-    For now it ignores what the user said and always replies "Hello World".
-    Later, `execute` is where you'd call an LLM, tools, etc.
-    """
+
+DEFAULT_UIPATH_BASE_URL = "https://staging.uipath.com/uipathlabs/Playground"
+DEFAULT_UIPATH_SCOPE = "OR.Jobs"
+DEFAULT_MCP_SERVER_URL = (
+    "https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/"
+    "e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server"
+)
+DEFAULT_MODEL_NAME = "gpt-4.1-mini-2025-04-14"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Use the available UiPath MCP tools when web "
+    "search would improve the answer. Keep answers concise and cite sources "
+    "returned by the tool when they are available."
+)
+A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest")
+
+AgentCall = Callable[[str, str], Awaitable[str]]
+_TOKEN_PROVIDER: "ExternalAppTokenProvider | None" = None
+
+
+class TokenGraphState(TypedDict, total=False):
+    task: str
+    access_token: str | None
+    refresh_attempted: bool
+    result: str | None
+
+
+class ExternalAppTokenProvider:
+    """Refreshes and caches UiPath external-app access tokens."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        client_id: str | None,
+        client_secret: str | None,
+        scope: str,
+        environ: MutableMapping[str, str] | None = None,
+        sdk_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.scope = scope
+        self.environ = environ if environ is not None else os.environ
+        self._sdk_factory = sdk_factory
+        self.cached_access_token = self.environ.get("UIPATH_ACCESS_TOKEN")
+
+    async def get_access_token(self, *, force_refresh: bool = False) -> str:
+        if self.cached_access_token and not force_refresh:
+            return self.cached_access_token
+
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError(
+                "Missing UiPath external app credentials. Set UIPATH_CLIENT_ID "
+                "and UIPATH_CLIENT_SECRET before calling the agent."
+            )
+
+        sdk_factory = self._sdk_factory or _load_uipath_sdk_factory()
+        sdk = sdk_factory(
+            base_url=self.base_url,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            scope=self.scope,
+        )
+        token = (
+            self.environ.get("UIPATH_ACCESS_TOKEN")
+            or getattr(sdk, "access_token", None)
+            or getattr(sdk, "_access_token", None)
+        )
+        if not token:
+            raise RuntimeError("UiPath SDK did not provide UIPATH_ACCESS_TOKEN.")
+
+        self.cached_access_token = token
+        return token
+
+    def clear_cached_access_token(self) -> None:
+        self.cached_access_token = None
+        self.environ.pop("UIPATH_ACCESS_TOKEN", None)
+
+
+def _load_uipath_sdk_factory() -> Callable[..., Any]:
+    from uipath.platform import UiPath
+
+    return UiPath
+
+
+def build_token_provider_from_env() -> ExternalAppTokenProvider:
+    return ExternalAppTokenProvider(
+        base_url=os.getenv("UIPATH_BASE_URL", DEFAULT_UIPATH_BASE_URL),
+        client_id=os.getenv("UIPATH_CLIENT_ID")
+        or os.getenv("UIPATH_EXTERNAL_APP_CLIENT_ID"),
+        client_secret=os.getenv("UIPATH_CLIENT_SECRET")
+        or os.getenv("UIPATH_EXTERNAL_APP_CLIENT_SECRET"),
+        scope=os.getenv("UIPATH_OAUTH_SCOPE", DEFAULT_UIPATH_SCOPE),
+    )
+
+
+def get_token_provider() -> ExternalAppTokenProvider:
+    global _TOKEN_PROVIDER
+    if _TOKEN_PROVIDER is None:
+        _TOKEN_PROVIDER = build_token_provider_from_env()
+    return _TOKEN_PROVIDER
+
+
+def add_a2a_bearer_auth(app: FastAPI, bearer_token: str | None) -> None:
+    if not bearer_token:
+        logger.warning("A2A_BEARER_TOKEN is not set; A2A routes are public.")
+        return
+
+    @app.middleware("http")
+    async def require_a2a_bearer_token(request: Request, call_next):
+        if not request.url.path.startswith(A2A_PROTECTED_PATH_PREFIXES):
+            return await call_next(request)
+
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(
+            token,
+            bearer_token,
+        ):
+            return JSONResponse(
+                {"error": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        return await call_next(request)
+
+
+def is_unauthorized_error(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code == 401
+    if isinstance(error, BaseExceptionGroup):
+        return any(is_unauthorized_error(item) for item in error.exceptions)
+    return False
+
+
+def build_token_refresh_graph(
+    *,
+    token_provider: Any,
+    agent_call: AgentCall,
+):
+    async def fetch_new_access_token(state: TokenGraphState) -> Command:
+        token = await token_provider.get_access_token(
+            force_refresh=bool(state.get("refresh_attempted"))
+            or not bool(state.get("access_token"))
+        )
+        return Command(update={"access_token": token})
+
+    async def connect_to_mcp(state: TokenGraphState) -> Command:
+        access_token = state.get("access_token")
+        if not access_token:
+            return Command(update={"access_token": None})
+
+        try:
+            result = await agent_call(state["task"], access_token)
+        except BaseException as error:
+            if is_unauthorized_error(error) and not state.get("refresh_attempted"):
+                clear = getattr(token_provider, "clear_cached_access_token", None)
+                if clear:
+                    clear()
+                return Command(update={"access_token": None, "refresh_attempted": True})
+            raise
+
+        return Command(update={"result": result})
+
+    def route_start(state: TokenGraphState) -> str:
+        return (
+            "connect_to_mcp"
+            if state.get("access_token")
+            else "fetch_new_access_token"
+        )
+
+    def route_after_connect(state: TokenGraphState) -> str:
+        return END if state.get("result") is not None else "fetch_new_access_token"
+
+    builder = StateGraph(TokenGraphState)
+    builder.add_node("fetch_new_access_token", fetch_new_access_token)
+    builder.add_node("connect_to_mcp", connect_to_mcp)
+    builder.add_conditional_edges(START, route_start)
+    builder.add_edge("fetch_new_access_token", "connect_to_mcp")
+    builder.add_conditional_edges("connect_to_mcp", route_after_connect)
+    return builder.compile()
+
+
+async def run_token_refresh_graph(
+    *,
+    task: str,
+    token_provider: Any,
+    agent_call: AgentCall,
+) -> str:
+    graph = build_token_refresh_graph(
+        token_provider=token_provider,
+        agent_call=agent_call,
+    )
+    result = await graph.ainvoke(
+        {
+            "task": task,
+            "access_token": getattr(token_provider, "cached_access_token", None),
+            "refresh_attempted": False,
+            "result": None,
+        }
+    )
+    if not result.get("result"):
+        raise RuntimeError("UiPath agent completed without a result.")
+    return result["result"]
+
+
+async def call_uipath_mcp_agent(
+    task: str,
+    access_token: str,
+    *,
+    mcp_server_url: str | None = None,
+    model_name: str | None = None,
+    system_prompt: str | None = None,
+) -> str:
+    from langchain.agents import create_agent
+    from langchain_mcp_adapters.tools import load_mcp_tools
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    try:
+        from langchain.messages import HumanMessage, SystemMessage
+    except ImportError:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+    resolved_mcp_url = mcp_server_url or os.getenv(
+        "UIPATH_MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
+    )
+    resolved_model_name = model_name or os.getenv(
+        "UIPATH_AGENT_MODEL", DEFAULT_MODEL_NAME
+    )
+    resolved_system_prompt = system_prompt or os.getenv(
+        "UIPATH_AGENT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT
+    )
+
+    async with streamablehttp_client(
+        url=resolved_mcp_url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=60,
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await load_mcp_tools(session)
+            model = build_chat_model(model_name=resolved_model_name)
+            agent = create_agent(model, tools=tools)
+            response = await agent.ainvoke(
+                {
+                    "messages": [
+                        SystemMessage(content=resolved_system_prompt),
+                        HumanMessage(content=task),
+                    ]
+                }
+            )
+            return _last_message_content(response)
+
+
+def _last_message_content(response: Any) -> str:
+    messages = response.get("messages") if isinstance(response, dict) else None
+    if not messages:
+        raise RuntimeError("LangChain agent response did not include messages.")
+
+    content = getattr(messages[-1], "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", str(item)) if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
+
+
+def build_chat_model(
+    *,
+    model_name: str,
+    openai_factory: Callable[..., Any] | None = None,
+) -> Any:
+    if openai_factory is None:
+        from uipath_langchain.chat.models import UiPathAzureChatOpenAI
+
+        openai_factory = UiPathAzureChatOpenAI
+    return openai_factory(model=model_name)
+
+
+async def invoke_uipath_agent(user_input: str) -> str:
+    token_provider = get_token_provider()
+    return await run_token_refresh_graph(
+        task=user_input,
+        token_provider=token_provider,
+        agent_call=call_uipath_mcp_agent,
+    )
+
+
+class UiPathAgentExecutor(AgentExecutor):
+    """A2A executor that delegates each message to the UiPath LangChain agent."""
+
+    def __init__(
+        self,
+        agent_runner: Callable[[str], Awaitable[str]] = invoke_uipath_agent,
+    ):
+        self.agent_runner = agent_runner
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
@@ -78,15 +386,29 @@ class HelloWorldExecutor(AgentExecutor):
         # Move the task into the "working" state.
         await updater.start_work()
 
-        # Do the "work". This is the part you'll replace with real logic.
         user_input = context.get_user_input()
         logger.info("Received: %r", user_input)
 
-        # Emit the result as an artifact, then mark the task complete.
+        try:
+            result = await self.agent_runner(user_input)
+        except Exception as error:
+            logger.exception("UiPath agent execution failed")
+            await updater.failed(
+                message=updater.new_agent_message(
+                    parts=[
+                        Part(
+                            text=(
+                                "UiPath agent failed while processing the request: "
+                                f"{error}"
+                            )
+                        )
+                    ]
+                )
+            )
+            return
+
         await updater.add_artifact(
-            parts=[Part(text="Hello World")],
-            name="response",
-            last_chunk=True,
+            parts=[Part(text=result)], name="response", last_chunk=True
         )
         await updater.complete()
 
@@ -110,20 +432,28 @@ def build_agent_card(host: str, port: int) -> AgentCard:
     """
     base_url = f"http://{host}:{port}"
     return AgentCard(
-        name="Hello World Agent",
-        description="A skeleton A2A agent that always replies 'Hello World'.",
-        provider=AgentProvider(organization="Playground", url="https://example.com"),
+        name="UiPath Web Search Agent",
+        description=(
+            "A2A agent backed by a UiPath LangChain agent and an authenticated "
+            "UiPath MCP web-search tool."
+        ),
+        provider=AgentProvider(
+            organization="UiPath Playground",
+            url="https://staging.uipath.com/uipathlabs/Playground",
+        ),
         version="0.1.0",
         capabilities=AgentCapabilities(streaming=True, push_notifications=False),
         default_input_modes=["text"],
         default_output_modes=["text"],
         skills=[
             AgentSkill(
-                id="hello_world",
-                name="Hello World",
-                description="Replies with a greeting.",
-                tags=["hello"],
-                examples=["hi", "hello"],
+                id="uipath_web_search",
+                name="UiPath MCP Web Search",
+                description=(
+                    "Answers questions using the configured UiPath MCP web search server."
+                ),
+                tags=["uipath", "mcp", "web-search"],
+                examples=["Search the web for the latest UiPath AgentHub updates."],
                 input_modes=["text"],
                 output_modes=["text"],
             )
@@ -152,12 +482,13 @@ def build_app(host: str, port: int) -> FastAPI:
     # The request handler is the bridge between the A2A protocol (incoming
     # requests) and your executor (the work). The task store tracks task state.
     request_handler = DefaultRequestHandler(
-        agent_executor=HelloWorldExecutor(),
+        agent_executor=UiPathAgentExecutor(),
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
     )
 
     app = FastAPI()
+    add_a2a_bearer_auth(app, os.getenv("A2A_BEARER_TOKEN"))
     add_a2a_routes_to_fastapi(
         app,
         agent_card_routes=create_agent_card_routes(agent_card=agent_card),
@@ -173,14 +504,16 @@ def build_app(host: str, port: int) -> FastAPI:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="Skeleton A2A agent server")
+    parser = argparse.ArgumentParser(description="UiPath-backed A2A agent server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
     args = parser.parse_args()
 
     app = build_app(args.host, args.port)
 
-    logger.info("Agent card: http://%s:%s/.well-known/agent-card.json", args.host, args.port)
+    logger.info(
+        "Agent card: http://%s:%s/.well-known/agent-card.json", args.host, args.port
+    )
     config = uvicorn.Config(app, host=args.host, port=args.port)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(uvicorn.Server(config).serve())

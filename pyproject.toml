@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "a2a-sdk[fastapi]>=1.1.0",
+    "langchain>=1.3.11",
+    "langchain-mcp-adapters==0.2.1",
+    "langgraph>=1.2.7",
+    "mcp==1.26.0",
+    "python-dotenv>=1.2.2",
+    "uipath>=2.2.45",
     "uipath-langchain>=0.9.33",
     "uvicorn>=0.49.0",
 ]

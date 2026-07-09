@@ -1,0 +1,29 @@
+# fly.toml app configuration file generated for tidy-log-6164 on 2026-07-01T16:42:43-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'tidy-log-6164'
+primary_region = 'dfw'
+
+[build]
+
+[env]
+  UIPATH_BASE_URL = 'https://staging.uipath.com/uipathlabs/Playground'
+  UIPATH_OAUTH_SCOPE = 'OR.Jobs'
+  UIPATH_MCP_SERVER_URL = 'https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server'
+  UIPATH_AGENT_MODEL = 'gpt-4.1-mini-2025-04-14'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024

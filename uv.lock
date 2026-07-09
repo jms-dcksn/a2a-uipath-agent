@@ -34,6 +34,12 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "a2a-sdk", extra = ["fastapi"] },
+    { name = "langchain" },
+    { name = "langchain-mcp-adapters" },
+    { name = "langgraph" },
+    { name = "mcp" },
+    { name = "python-dotenv" },
+    { name = "uipath" },
     { name = "uipath-langchain" },
     { name = "uvicorn" },
 ]
@@ -41,6 +47,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", extras = ["fastapi"], specifier = ">=1.1.0" },
+    { name = "langchain", specifier = ">=1.3.11" },
+    { name = "langchain-mcp-adapters", specifier = "==0.2.1" },
+    { name = "langgraph", specifier = ">=1.2.7" },
+    { name = "mcp", specifier = "==1.26.0" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "uipath", specifier = ">=2.2.45" },
     { name = "uipath-langchain", specifier = ">=0.9.33" },
     { name = "uvicorn", specifier = ">=0.49.0" },
 ]
