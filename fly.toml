@@ -9,8 +9,9 @@ primary_region = 'dfw'
 [build]
 
 [env]
+  A2A_PUBLIC_URL = 'https://tidy-log-6164.fly.dev'
   UIPATH_BASE_URL = 'https://staging.uipath.com/uipathlabs/Playground'
-  UIPATH_OAUTH_SCOPE = 'OR.Jobs'
+  UIPATH_OAUTH_SCOPE = 'OR.Execution OR.Jobs'
   UIPATH_MCP_SERVER_URL = 'https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server'
   UIPATH_AGENT_MODEL = 'gpt-4.1-mini-2025-04-14'
 

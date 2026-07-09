@@ -35,7 +35,8 @@ discover the agent before authenticating task calls.
 
 `ExternalAppTokenProvider` reads external-app configuration from environment
 variables and lazily creates `uipath.platform.UiPath(...)` only when a request
-needs a token. It caches `UIPATH_ACCESS_TOKEN` in process memory.
+needs a token. When external-app credentials are present, it fetches and caches
+that token in process memory instead of reusing a user token from the environment.
 
 `run_token_refresh_graph()` wraps the MCP call in a LangGraph state machine:
 
@@ -61,7 +62,7 @@ At runtime it:
 1. Opens the MCP streamable HTTP client with
    `Authorization: Bearer <access_token>`.
 2. Loads MCP tools with `langchain_mcp_adapters.tools.load_mcp_tools`.
-3. Builds a `UiPathAzureChatOpenAI` model.
+3. Builds a `UiPathAzureChatOpenAI` model with the same access token.
 4. Creates a LangChain agent with `create_agent`.
 5. Invokes the agent with the system prompt and user task.
 
@@ -79,12 +80,12 @@ Defaults target staging Playground and the supplied MCP endpoint. Override these
 when needed:
 
 ```bash
-export UIPATH_BASE_URL="https://staging.uipath.com/uipathlabs/Playground"
-export UIPATH_OAUTH_SCOPE="OR.Jobs"
+export UIPATH_URL="https://staging.uipath.com/uipathlabs/Playground"
+export UIPATH_OAUTH_SCOPE="OR.Execution OR.Jobs"
 export UIPATH_MCP_SERVER_URL="https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server"
-export UIPATH_AGENT_MODEL="gpt-4o-mini-2024-07-18"
+export UIPATH_AGENT_MODEL="gpt-4.1-mini-2025-04-14"
 ```
 
-If the MCP endpoint returns 403 after token refresh succeeds, adjust
-`UIPATH_OAUTH_SCOPE` and the external app's granted scopes to match the server's
-required permissions.
+If the MCP endpoint returns 403 after token refresh succeeds, verify both the
+external app's granted scopes and its Orchestrator folder role assignment for the
+folder that owns the MCP server.

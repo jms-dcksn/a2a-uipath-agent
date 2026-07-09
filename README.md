@@ -19,10 +19,10 @@ export A2A_BEARER_TOKEN="<token-clients-must-send>"
 Optional overrides:
 
 ```bash
-export UIPATH_BASE_URL="https://staging.uipath.com/uipathlabs/Playground"
-export UIPATH_OAUTH_SCOPE="OR.Jobs"
+export UIPATH_URL="https://staging.uipath.com/uipathlabs/Playground"
+export UIPATH_OAUTH_SCOPE="OR.Execution OR.Jobs"
 export UIPATH_MCP_SERVER_URL="https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server"
-export UIPATH_AGENT_MODEL="gpt-4o-mini-2024-07-18"
+export UIPATH_AGENT_MODEL="gpt-4.1-mini-2025-04-14"
 ```
 
 ## Run

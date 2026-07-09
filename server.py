@@ -58,7 +58,7 @@ if load_dotenv:
 
 
 DEFAULT_UIPATH_BASE_URL = "https://staging.uipath.com/uipathlabs/Playground"
-DEFAULT_UIPATH_SCOPE = "OR.Jobs"
+DEFAULT_UIPATH_SCOPE = "OR.Execution OR.Jobs"
 DEFAULT_MCP_SERVER_URL = (
     "https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/"
     "e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server"
@@ -101,7 +101,11 @@ class ExternalAppTokenProvider:
         self.scope = scope
         self.environ = environ if environ is not None else os.environ
         self._sdk_factory = sdk_factory
-        self.cached_access_token = self.environ.get("UIPATH_ACCESS_TOKEN")
+        self.cached_access_token = (
+            None
+            if self.client_id and self.client_secret
+            else self.environ.get("UIPATH_ACCESS_TOKEN")
+        )
 
     async def get_access_token(self, *, force_refresh: bool = False) -> str:
         if self.cached_access_token and not force_refresh:
@@ -121,9 +125,9 @@ class ExternalAppTokenProvider:
             scope=self.scope,
         )
         token = (
-            self.environ.get("UIPATH_ACCESS_TOKEN")
-            or getattr(sdk, "access_token", None)
+            _extract_sdk_access_token(sdk)
             or getattr(sdk, "_access_token", None)
+            or self.environ.get("UIPATH_ACCESS_TOKEN")
         )
         if not token:
             raise RuntimeError("UiPath SDK did not provide UIPATH_ACCESS_TOKEN.")
@@ -142,9 +146,20 @@ def _load_uipath_sdk_factory() -> Callable[..., Any]:
     return UiPath
 
 
+def _extract_sdk_access_token(sdk: Any) -> str | None:
+    token = getattr(sdk, "access_token", None)
+    if token:
+        return token
+
+    config = getattr(sdk, "_config", None)
+    return getattr(config, "secret", None)
+
+
 def build_token_provider_from_env() -> ExternalAppTokenProvider:
     return ExternalAppTokenProvider(
-        base_url=os.getenv("UIPATH_BASE_URL", DEFAULT_UIPATH_BASE_URL),
+        base_url=os.getenv("UIPATH_BASE_URL")
+        or os.getenv("UIPATH_URL")
+        or DEFAULT_UIPATH_BASE_URL,
         client_id=os.getenv("UIPATH_CLIENT_ID")
         or os.getenv("UIPATH_EXTERNAL_APP_CLIENT_ID"),
         client_secret=os.getenv("UIPATH_CLIENT_SECRET")
@@ -188,6 +203,11 @@ def add_a2a_bearer_auth(app: FastAPI, bearer_token: str | None) -> None:
 def is_unauthorized_error(error: BaseException) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code == 401
+    response = getattr(error, "response", None)
+    if getattr(error, "status_code", None) == 401:
+        return True
+    if getattr(response, "status_code", None) == 401:
+        return True
     if isinstance(error, BaseExceptionGroup):
         return any(is_unauthorized_error(item) for item in error.exceptions)
     return False
@@ -300,7 +320,10 @@ async def call_uipath_mcp_agent(
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await load_mcp_tools(session)
-            model = build_chat_model(model_name=resolved_model_name)
+            model = build_chat_model(
+                model_name=resolved_model_name,
+                access_token=access_token,
+            )
             agent = create_agent(model, tools=tools)
             response = await agent.ainvoke(
                 {
@@ -332,13 +355,17 @@ def _last_message_content(response: Any) -> str:
 def build_chat_model(
     *,
     model_name: str,
+    access_token: str | None = None,
     openai_factory: Callable[..., Any] | None = None,
 ) -> Any:
     if openai_factory is None:
         from uipath_langchain.chat.models import UiPathAzureChatOpenAI
 
         openai_factory = UiPathAzureChatOpenAI
-    return openai_factory(model=model_name)
+    kwargs = {"model": model_name}
+    if access_token:
+        kwargs["access_token"] = access_token
+    return openai_factory(**kwargs)
 
 
 async def invoke_uipath_agent(user_input: str) -> str:
@@ -430,7 +457,7 @@ def build_agent_card(host: str, port: int) -> AgentCard:
     A2A clients fetch it from /.well-known/agent-card.json to learn the agent's
     name, what it can do (skills), and how to reach it (interfaces).
     """
-    base_url = f"http://{host}:{port}"
+    base_url = os.getenv("A2A_PUBLIC_URL", f"http://{host}:{port}").rstrip("/")
     return AgentCard(
         name="UiPath Web Search Agent",
         description=(
