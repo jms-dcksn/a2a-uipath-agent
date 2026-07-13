@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">UiPath-backed A2A agent architecture</title>
+  <desc id="desc">An A2A client calls a FastAPI server on Fly.io. A LangGraph token refresh wrapper authenticates through a UiPath OAuth external app, then a LangChain create_agent instance calls the UiPath Azure chat model and a UiPath-hosted coded MCP web search server over streamable HTTP.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#343a40"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #1f2937; }
+      .group { font: 700 20px Arial, sans-serif; fill: #1f2937; }
+      .box-title { font: 700 17px Arial, sans-serif; fill: #1f2937; }
+      .body { font: 15px Arial, sans-serif; fill: #374151; }
+      .small { font: 13px Arial, sans-serif; fill: #4b5563; }
+      .label { font: 700 13px Arial, sans-serif; fill: #343a40; }
+      .arrow { stroke: #343a40; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="900" fill="#ffffff"/>
+  <text x="720" y="48" text-anchor="middle" class="title">UiPath-backed A2A Agent</text>
+
+  <rect x="38" y="105" width="220" height="690" rx="18" fill="#f8f9fa" stroke="#868e96" stroke-width="2"/>
+  <text x="148" y="140" text-anchor="middle" class="group">A2A client</text>
+  <rect x="68" y="210" width="160" height="105" rx="12" fill="#e7f5ff" stroke="#228be6" stroke-width="2"/>
+  <text x="148" y="248" text-anchor="middle" class="box-title">Discovery</text>
+  <text x="148" y="276" text-anchor="middle" class="body">Agent Card</text>
+  <text x="148" y="299" text-anchor="middle" class="small">public GET</text>
+  <rect x="68" y="480" width="160" height="115" rx="12" fill="#e7f5ff" stroke="#228be6" stroke-width="2"/>
+  <text x="148" y="518" text-anchor="middle" class="box-title">A2A request</text>
+  <text x="148" y="546" text-anchor="middle" class="body">JSON-RPC or</text>
+  <text x="148" y="568" text-anchor="middle" class="body">HTTP+JSON</text>
+
+  <rect x="300" y="105" width="650" height="690" rx="18" fill="#fff9db" stroke="#f08c00" stroke-width="2"/>
+  <text x="625" y="140" text-anchor="middle" class="group">Fly.io deployment</text>
+  <rect x="342" y="180" width="566" height="135" rx="12" fill="#fff3bf" stroke="#f08c00" stroke-width="2"/>
+  <text x="625" y="212" text-anchor="middle" class="box-title">FastAPI + A2A SDK</text>
+  <text x="625" y="241" text-anchor="middle" class="body">build_agent_card() → /.well-known/agent-card.json</text>
+  <text x="625" y="268" text-anchor="middle" class="body">DefaultRequestHandler → UiPathAgentExecutor</text>
+  <text x="625" y="293" text-anchor="middle" class="small">A2A bearer middleware protects message routes</text>
+
+  <rect x="342" y="360" width="566" height="170" rx="12" fill="#f3f0ff" stroke="#7950f2" stroke-width="2"/>
+  <text x="625" y="393" text-anchor="middle" class="box-title">LangGraph token-refresh wrapper</text>
+  <text x="625" y="422" text-anchor="middle" class="body">ExternalAppTokenProvider acquires and caches token</text>
+  <text x="625" y="449" text-anchor="middle" class="body">401 → clear cached token → refresh → retry once</text>
+  <text x="625" y="479" text-anchor="middle" class="small">OAuth confidential external app</text>
+  <text x="625" y="501" text-anchor="middle" class="small">Scopes: OR.Execution OR.Jobs</text>
+
+  <rect x="342" y="590" width="566" height="135" rx="12" fill="#e6fcf5" stroke="#0ca678" stroke-width="2"/>
+  <text x="625" y="624" text-anchor="middle" class="box-title">LangChain agent</text>
+  <text x="625" y="653" text-anchor="middle" class="body">create_agent(model, tools)</text>
+  <text x="625" y="680" text-anchor="middle" class="body">System prompt + A2A user message</text>
+  <text x="625" y="705" text-anchor="middle" class="small">Final answer becomes an A2A response artifact</text>
+
+  <rect x="992" y="105" width="410" height="690" rx="18" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
+  <text x="1197" y="140" text-anchor="middle" class="group">UiPath Automation Cloud</text>
+  <rect x="1032" y="180" width="330" height="120" rx="12" fill="#f3f0ff" stroke="#7950f2" stroke-width="2"/>
+  <text x="1197" y="214" text-anchor="middle" class="box-title">Identity / OAuth</text>
+  <text x="1197" y="243" text-anchor="middle" class="body">External app client credentials</text>
+  <text x="1197" y="271" text-anchor="middle" class="small">Issues scoped access token</text>
+
+  <rect x="1032" y="370" width="330" height="125" rx="12" fill="#e7f5ff" stroke="#228be6" stroke-width="2"/>
+  <text x="1197" y="406" text-anchor="middle" class="box-title">UiPath Azure chat model</text>
+  <text x="1197" y="436" text-anchor="middle" class="body">UiPathAzureChatOpenAI</text>
+  <text x="1197" y="466" text-anchor="middle" class="small">Fresh token passed explicitly</text>
+
+  <rect x="1032" y="560" width="330" height="165" rx="12" fill="#e6fcf5" stroke="#0ca678" stroke-width="2"/>
+  <text x="1197" y="594" text-anchor="middle" class="box-title">UiPath-hosted coded MCP server</text>
+  <text x="1197" y="624" text-anchor="middle" class="body">Python MCP tool implementation</text>
+  <text x="1197" y="652" text-anchor="middle" class="body">UiPath Web Search Activity</text>
+  <text x="1197" y="684" text-anchor="middle" class="small">Streamable HTTP + bearer token</text>
+
+  <path d="M228 262 H342" class="arrow"/>
+  <text x="285" y="246" text-anchor="middle" class="label">GET card</text>
+  <path d="M342 286 H228" class="arrow dash"/>
+  <text x="285" y="310" text-anchor="middle" class="label">metadata</text>
+  <path d="M228 537 H310 V270 H342" class="arrow"/>
+  <text x="278" y="522" text-anchor="middle" class="label">SendMessage</text>
+  <path d="M625 315 V360" class="arrow"/>
+  <path d="M625 530 V590" class="arrow"/>
+  <path d="M908 425 H968 V240 H1032" class="arrow"/>
+  <text x="969" y="224" text-anchor="middle" class="label">token request</text>
+  <path d="M1032 270 H982 V395 H908" class="arrow dash"/>
+  <text x="970" y="380" text-anchor="middle" class="label">access token</text>
+  <path d="M908 635 H968 V432 H1032" class="arrow"/>
+  <text x="973" y="416" text-anchor="middle" class="label">chat</text>
+  <path d="M908 675 H985 V642 H1032" class="arrow"/>
+  <text x="974" y="661" text-anchor="middle" class="label">MCP tools</text>
+  <path d="M1032 704 H980 V716 H908" class="arrow dash"/>
+  <text x="970" y="744" text-anchor="middle" class="label">tool results</text>
+  <path d="M342 700 H285 V575 H228" class="arrow dash"/>
+  <text x="286" y="724" text-anchor="middle" class="label">A2A task + artifact</text>
+</svg>
