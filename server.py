@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from request_logging import add_a2a_request_logging, is_request_logging_enabled
+
 from a2a.server.agent_execution.agent_executor import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
 from a2a.server.events.event_queue import EventQueue
@@ -69,7 +71,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "search would improve the answer. Keep answers concise and cite sources "
     "returned by the tool when they are available."
 )
-A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest")
+A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest", "/v1")
 
 AgentCall = Callable[[str, str], Awaitable[str]]
 _TOKEN_PROVIDER: "ExternalAppTokenProvider | None" = None
@@ -198,6 +200,20 @@ def add_a2a_bearer_auth(app: FastAPI, bearer_token: str | None) -> None:
             )
 
         return await call_next(request)
+
+
+def add_v0_3_routes(
+    app: FastAPI,
+    request_handler: DefaultRequestHandler,
+) -> None:
+    """Mount the complete HTTP+JSON route set supplied by the v0.3 adapter."""
+    # Import after a2a.server.routes is initialized to avoid the SDK's circular
+    # rest_adapter -> routes.__init__ -> rest_routes -> rest_adapter import.
+    from a2a.compat.v0_3.rest_adapter import REST03Adapter
+
+    adapter = REST03Adapter(http_handler=request_handler)
+    for (path, method), endpoint in adapter.routes().items():
+        app.add_route(path, endpoint, methods=[method])
 
 
 def is_unauthorized_error(error: BaseException) -> bool:
@@ -515,7 +531,15 @@ def build_app(host: str, port: int) -> FastAPI:
     )
 
     app = FastAPI()
+    add_a2a_request_logging(
+        app,
+        enabled=is_request_logging_enabled(os.getenv("A2A_REQUEST_LOGGING")),
+    )
+    # Register auth after request logging so Starlette makes auth the outer
+    # middleware and rejects unauthorized requests before reading their bodies.
     add_a2a_bearer_auth(app, os.getenv("A2A_BEARER_TOKEN"))
+    # Mount legacy routes before the SDK's JSON-RPC tenant catch-all.
+    add_v0_3_routes(app, request_handler)
     add_a2a_routes_to_fastapi(
         app,
         agent_card_routes=create_agent_card_routes(agent_card=agent_card),

@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY server.py ./
+COPY server.py request_logging.py ./
 
 EXPOSE 8080
 
