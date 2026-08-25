@@ -13,4 +13,7 @@ COPY server.py request_logging.py ./
 
 EXPOSE 8080
 
-CMD ["uv", "run", "--frozen", "--no-dev", "server.py", "--host", "0.0.0.0", "--port", "8080"]
+# Run the venv interpreter directly. "uv run" re-syncs the environment and
+# recompiles bytecode for 5000+ files on every boot, which pushed start-up
+# past the Fly proxy's connect timeout and returned 502 on cold starts.
+CMD ["/app/.venv/bin/python", "server.py", "--host", "0.0.0.0", "--port", "8080"]

@@ -42,7 +42,10 @@ from a2a.types import (
     AgentInterface,
     AgentProvider,
     AgentSkill,
+    HTTPAuthSecurityScheme,
     Part,
+    SecurityRequirement,
+    SecurityScheme,
     Task,
     TaskState,
     TaskStatus,
@@ -72,6 +75,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "returned by the tool when they are available."
 )
 A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest", "/v1")
+A2A_BEARER_SCHEME_NAME = "bearerAuth"
 
 AgentCall = Callable[[str, str], Awaitable[str]]
 _TOKEN_PROVIDER: "ExternalAppTokenProvider | None" = None
@@ -426,8 +430,13 @@ class UiPathAgentExecutor(AgentExecutor):
             context_id=context_id,
         )
 
-        # Move the task into the "working" state.
-        await updater.start_work()
+        # Move the task into the "working" state. A single call can take about
+        # 30 seconds, so give streaming clients something to show meanwhile.
+        await updater.start_work(
+            message=updater.new_agent_message(
+                parts=[Part(text="Connecting to the UiPath MCP web search tool.")]
+            )
+        )
 
         user_input = context.get_user_input()
         logger.info("Received: %r", user_input)
@@ -474,6 +483,22 @@ def build_agent_card(host: str, port: int) -> AgentCard:
     name, what it can do (skills), and how to reach it (interfaces).
     """
     base_url = os.getenv("A2A_PUBLIC_URL", f"http://{host}:{port}").rstrip("/")
+
+    # Clients only send a token if the card asks for one. Advertise the bearer
+    # scheme whenever the middleware is armed, so the two never disagree.
+    security_schemes = {}
+    security_requirements = []
+    if os.getenv("A2A_BEARER_TOKEN"):
+        security_schemes[A2A_BEARER_SCHEME_NAME] = SecurityScheme(
+            http_auth_security_scheme=HTTPAuthSecurityScheme(
+                scheme="bearer",
+                description="Shared bearer token issued by the agent owner.",
+            )
+        )
+        security_requirements.append(
+            SecurityRequirement(schemes={A2A_BEARER_SCHEME_NAME: {}})
+        )
+
     return AgentCard(
         name="UiPath Web Search Agent",
         description=(
@@ -488,6 +513,8 @@ def build_agent_card(host: str, port: int) -> AgentCard:
         capabilities=AgentCapabilities(streaming=True, push_notifications=False),
         default_input_modes=["text"],
         default_output_modes=["text"],
+        security_schemes=security_schemes,
+        security_requirements=security_requirements,
         skills=[
             AgentSkill(
                 id="uipath_web_search",
@@ -518,6 +545,68 @@ def build_agent_card(host: str, port: int) -> AgentCard:
     )
 
 
+def build_legacy_agent_card(agent_card: AgentCard) -> dict[str, Any]:
+    """Return the same agent in the pre-1.0 card shape.
+
+    Cards before v1.0 carry a single "url" plus "preferredTransport" instead of
+    "supportedInterfaces". A client written against that spec cannot resolve an
+    endpoint from a 1.0 card, so serve it a shape it understands.
+    """
+    jsonrpc_url = next(
+        (
+            interface.url
+            for interface in agent_card.supported_interfaces
+            if interface.protocol_binding == "JSONRPC"
+        ),
+        "",
+    )
+    card: dict[str, Any] = {
+        "name": agent_card.name,
+        "description": agent_card.description,
+        "url": jsonrpc_url,
+        "preferredTransport": "JSONRPC",
+        "protocolVersion": "0.3.0",
+        "version": agent_card.version,
+        "provider": {
+            "organization": agent_card.provider.organization,
+            "url": agent_card.provider.url,
+        },
+        "capabilities": {
+            "streaming": agent_card.capabilities.streaming,
+            "pushNotifications": agent_card.capabilities.push_notifications,
+        },
+        "defaultInputModes": list(agent_card.default_input_modes),
+        "defaultOutputModes": list(agent_card.default_output_modes),
+        "skills": [
+            {
+                "id": skill.id,
+                "name": skill.name,
+                "description": skill.description,
+                "tags": list(skill.tags),
+                "examples": list(skill.examples),
+                "inputModes": list(skill.input_modes),
+                "outputModes": list(skill.output_modes),
+            }
+            for skill in agent_card.skills
+        ],
+    }
+    if A2A_BEARER_SCHEME_NAME in agent_card.security_schemes:
+        card["securitySchemes"] = {
+            A2A_BEARER_SCHEME_NAME: {"type": "http", "scheme": "bearer"}
+        }
+        card["security"] = [{A2A_BEARER_SCHEME_NAME: []}]
+    return card
+
+
+def add_legacy_agent_card_route(app: FastAPI, agent_card: AgentCard) -> None:
+    """Serve the pre-1.0 well-known path, which the SDK no longer mounts."""
+    legacy_card = build_legacy_agent_card(agent_card)
+
+    @app.get("/.well-known/agent.json")
+    async def legacy_agent_card() -> JSONResponse:
+        return JSONResponse(legacy_card)
+
+
 def build_app(host: str, port: int) -> FastAPI:
     """Wire the executor + agent card into a FastAPI app exposing A2A routes."""
     agent_card = build_agent_card(host, port)
@@ -539,12 +628,18 @@ def build_app(host: str, port: int) -> FastAPI:
     # middleware and rejects unauthorized requests before reading their bodies.
     add_a2a_bearer_auth(app, os.getenv("A2A_BEARER_TOKEN"))
     # Mount legacy routes before the SDK's JSON-RPC tenant catch-all.
+    add_legacy_agent_card_route(app, agent_card)
     add_v0_3_routes(app, request_handler)
     add_a2a_routes_to_fastapi(
         app,
         agent_card_routes=create_agent_card_routes(agent_card=agent_card),
         jsonrpc_routes=create_jsonrpc_routes(
-            request_handler=request_handler, rpc_url="/a2a/jsonrpc"
+            request_handler=request_handler,
+            rpc_url="/a2a/jsonrpc",
+            # Without this, a client that omits the A2A-Version header is read
+            # as v0.3 and rejected, and v0.3 method names such as
+            # "message/send" return -32601.
+            enable_v0_3_compat=True,
         ),
         rest_routes=create_rest_routes(
             request_handler=request_handler, path_prefix="/a2a/rest"
