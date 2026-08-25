@@ -536,11 +536,23 @@ def build_agent_card(host: str, port: int) -> AgentCard:
         # Gateway does - looks for a v0.3 interface and cannot use a card that
         # only offers 1.0. The endpoint itself serves both, because the routes
         # are built with enable_v0_3_compat=True.
+        #
+        # Order matters for v0.3 clients. The SDK builds the legacy card from
+        # the FIRST interface whose version is 0.3 or empty, and that one
+        # supplies the legacy "url" and "preferredTransport". The UiPath
+        # Integration Service A2A connector needs HTTP+JSON and appends
+        # /v1/message:send to the url itself, so the HTTP+JSON 0.3 entry comes
+        # first and carries the bare base URL with no path.
         supported_interfaces=[
             AgentInterface(
                 protocol_binding="JSONRPC",
                 protocol_version="1.0",
                 url=f"{base_url}/a2a/jsonrpc",
+            ),
+            AgentInterface(
+                protocol_binding="HTTP+JSON",
+                protocol_version="0.3",
+                url=base_url,
             ),
             AgentInterface(
                 protocol_binding="JSONRPC",

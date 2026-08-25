@@ -461,8 +461,11 @@ class AgentCardTests(unittest.TestCase):
             interfaces,
             [
                 ("JSONRPC", "1.0", "https://tidy-log-6164.fly.dev/a2a/jsonrpc"),
-                # Clients that speak v0.3, such as the UiPath Agent Gateway,
-                # need a v0.3 interface or they cannot use the card at all.
+                # The first v0.3 entry becomes the legacy card's url and
+                # preferredTransport. The UiPath Integration Service A2A
+                # connector needs HTTP+JSON on the bare base URL, because it
+                # appends /v1/message:send itself.
+                ("HTTP+JSON", "0.3", "https://tidy-log-6164.fly.dev"),
                 ("JSONRPC", "0.3", "https://tidy-log-6164.fly.dev/a2a/jsonrpc"),
                 ("HTTP+JSON", "1.0", "https://tidy-log-6164.fly.dev/a2a/rest"),
             ],
