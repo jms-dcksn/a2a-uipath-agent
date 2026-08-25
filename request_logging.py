@@ -11,7 +11,7 @@ from starlette.datastructures import Headers
 
 logger = logging.getLogger(__name__)
 
-LOGGED_PATH_PREFIXES = ("/v1/", "/a2a/")
+LOGGED_PATH_PREFIXES = ("/v1/", "/a2a/", "/.well-known/")
 MAX_LOGGED_BODY_BYTES = 1_048_576
 REDACTED = "[REDACTED]"
 SENSITIVE_NAME_MARKERS = (

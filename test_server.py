@@ -453,13 +453,19 @@ class AgentCardTests(unittest.TestCase):
         ):
             card = build_agent_card("0.0.0.0", 8080)
 
+        interfaces = [
+            (item.protocol_binding, item.protocol_version, item.url)
+            for item in card.supported_interfaces
+        ]
         self.assertEqual(
-            card.supported_interfaces[0].url,
-            "https://tidy-log-6164.fly.dev/a2a/jsonrpc",
-        )
-        self.assertEqual(
-            card.supported_interfaces[1].url,
-            "https://tidy-log-6164.fly.dev/a2a/rest",
+            interfaces,
+            [
+                ("JSONRPC", "1.0", "https://tidy-log-6164.fly.dev/a2a/jsonrpc"),
+                # Clients that speak v0.3, such as the UiPath Agent Gateway,
+                # need a v0.3 interface or they cannot use the card at all.
+                ("JSONRPC", "0.3", "https://tidy-log-6164.fly.dev/a2a/jsonrpc"),
+                ("HTTP+JSON", "1.0", "https://tidy-log-6164.fly.dev/a2a/rest"),
+            ],
         )
 
 
