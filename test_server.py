@@ -13,7 +13,9 @@ from server import (
     build_chat_model,
     build_agent_card,
     build_token_provider_from_env,
+    describe_invalid_v0_3_message,
     is_unauthorized_error,
+    normalize_v0_3_message_payload,
     run_token_refresh_graph,
 )
 
@@ -494,6 +496,135 @@ class FakeRequestContext:
 
     def get_user_input(self):
         return self._user_input
+
+
+CONNECTOR_MESSAGE_BODY = {
+    "message": {
+        "capabilities": "uipath_web_search",
+        "content": ["latest US Open news"],
+    }
+}
+
+
+class V03MessageNormalizationTests(unittest.TestCase):
+    def test_bare_string_content_becomes_a_text_part(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(
+            normalized["message"]["content"],
+            [{"text": "latest US Open news"}],
+        )
+
+    def test_capabilities_is_kept_as_message_metadata(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(
+            normalized["message"]["metadata"],
+            {"capabilities": "uipath_web_search"},
+        )
+
+    def test_missing_role_defaults_to_user(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(normalized["message"]["role"], "ROLE_USER")
+
+    def test_missing_message_id_is_filled_in(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertTrue(normalized["message"]["messageId"])
+
+    def test_json_rpc_style_parts_and_role_are_translated(self):
+        normalized = normalize_v0_3_message_payload(
+            {
+                "message": {
+                    "messageId": "m1",
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "hello"}],
+                }
+            }
+        )
+
+        self.assertEqual(normalized["message"]["role"], "ROLE_USER")
+        self.assertEqual(
+            normalized["message"]["content"],
+            [{"kind": "text", "text": "hello"}],
+        )
+        self.assertNotIn("parts", normalized["message"])
+
+    def test_a_valid_body_is_left_unchanged(self):
+        payload = {
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "content": [{"text": "hello"}],
+            }
+        }
+
+        self.assertEqual(normalize_v0_3_message_payload(payload), payload)
+
+    def test_describe_invalid_message_names_the_empty_content_list(self):
+        self.assertEqual(
+            describe_invalid_v0_3_message({"message": {"content": []}}),
+            "message.content must be a non-empty list of parts",
+        )
+
+    def test_describe_invalid_message_names_the_offending_part(self):
+        self.assertEqual(
+            describe_invalid_v0_3_message(
+                {"message": {"content": [{"text": "ok"}, {"kind": "text"}]}}
+            ),
+            'message.content[1] must set one of "text", "file" or "data"',
+        )
+
+    def test_describe_invalid_message_accepts_a_valid_body(self):
+        self.assertIsNone(
+            describe_invalid_v0_3_message(
+                {"message": {"content": [{"text": "hello"}]}}
+            )
+        )
+
+
+class V03MessageSendRouteTests(unittest.TestCase):
+    """The v0.3 HTTP+JSON route the UiPath A2A connector actually calls."""
+
+    def setUp(self):
+        self.received = []
+
+        async def fake_agent_runner(user_input):
+            self.received.append(user_input)
+            return "Alcaraz won in four sets."
+
+        patcher = patch(
+            "server.UiPathAgentExecutor",
+            lambda: UiPathAgentExecutor(fake_agent_runner),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(build_app("127.0.0.1", 9999))
+
+    def test_connector_message_shape_reaches_the_agent(self):
+        response = self.client.post("/v1/message:send", json=CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.received, ["latest US Open news"])
+
+    def test_unfixable_message_returns_400_naming_the_field(self):
+        response = self.client.post("/v1/message:send", json={"message": {}})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"],
+            "message.content must be a non-empty list of parts",
+        )
+
+    def test_malformed_json_returns_400(self):
+        response = self.client.post(
+            "/v1/message:send",
+            content=b"{not json",
+            headers={"content-type": "application/json"},
+        )
+
+        self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":

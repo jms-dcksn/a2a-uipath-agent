@@ -9,9 +9,11 @@ Then fetch its public "business card":
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
+import uuid
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any, TypedDict
 
@@ -76,6 +78,21 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest", "/v1")
 A2A_BEARER_SCHEME_NAME = "bearerAuth"
+
+# The v0.3 HTTP+JSON routes that carry a message and therefore need the
+# connector-compatibility shim below.
+V0_3_MESSAGE_PATHS = ("/v1/message:send", "/v1/message:stream")
+# A v0.3 Part is a oneof; exactly one of these keys carries the payload.
+PART_CONTENT_KEYS = ("text", "file", "data")
+# Protobuf JSON wants the enum name. Accept the spellings other A2A bindings
+# and older clients use.
+ROLE_ALIASES = {
+    "user": "ROLE_USER",
+    "role_user": "ROLE_USER",
+    "agent": "ROLE_AGENT",
+    "assistant": "ROLE_AGENT",
+    "role_agent": "ROLE_AGENT",
+}
 
 AgentCall = Callable[[str, str], Awaitable[str]]
 _TOKEN_PROVIDER: "ExternalAppTokenProvider | None" = None
@@ -206,6 +223,149 @@ def add_a2a_bearer_auth(app: FastAPI, bearer_token: str | None) -> None:
         return await call_next(request)
 
 
+def normalize_v0_3_part(part: Any) -> Any:
+    """Turn a bare string into a text Part; leave real Parts alone."""
+    return {"text": part} if isinstance(part, str) else part
+
+
+def normalize_v0_3_message(message: Any) -> Any:
+    """Rewrite a near-miss message into the fields the v0.3 binding parses.
+
+    The UiPath Integration Service A2A connector sends its own activity fields
+    rather than an A2A message: the skill id as "capabilities", and the message
+    text as a list of bare strings under "content". That shape is invalid in
+    both v0.3 and v1.0, so no amount of version support accepts it.
+    """
+    if not isinstance(message, dict):
+        return message
+
+    normalized = dict(message)
+
+    # v0.3 JSON-RPC names the list "parts". The HTTP+JSON binding is generated
+    # from the proto, where the same field is "content".
+    if "content" not in normalized and isinstance(normalized.get("parts"), list):
+        normalized["content"] = normalized.pop("parts")
+
+    content = normalized.get("content")
+    if isinstance(content, list):
+        normalized["content"] = [normalize_v0_3_part(part) for part in content]
+
+    # A skill id has no home on a v0.3 message. Keep it as metadata instead of
+    # dropping it, so the executor can still see which skill was asked for.
+    requested_skill = normalized.pop("capabilities", None)
+    if requested_skill is not None:
+        metadata = normalized.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata.setdefault("capabilities", requested_skill)
+        normalized["metadata"] = metadata
+
+    # An unset role decodes to ROLE_UNSPECIFIED, which the SDK maps to "agent".
+    # The message would then look like the agent's own turn and
+    # context.get_user_input() would return nothing.
+    role = normalized.get("role")
+    normalized["role"] = (
+        ROLE_ALIASES.get(role.casefold(), role)
+        if isinstance(role, str) and role
+        else "ROLE_USER"
+    )
+
+    if not normalized.get("messageId"):
+        normalized["messageId"] = uuid.uuid4().hex
+
+    return normalized
+
+
+def normalize_v0_3_message_payload(payload: Any) -> Any:
+    """Normalize the message inside a v0.3 send/stream request body."""
+    if not isinstance(payload, dict) or "message" not in payload:
+        return payload
+
+    normalized = dict(payload)
+    normalized["message"] = normalize_v0_3_message(payload["message"])
+    return normalized
+
+
+def describe_invalid_v0_3_message(payload: Any) -> str | None:
+    """Name the first field that stops this body becoming a v0.3 message."""
+    if not isinstance(payload, dict):
+        return "body must be a JSON object"
+
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return 'body must contain a "message" object'
+
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return "message.content must be a non-empty list of parts"
+
+    for index, part in enumerate(content):
+        if not isinstance(part, dict) or not any(
+            key in part for key in PART_CONTENT_KEYS
+        ):
+            return (
+                f"message.content[{index}] must set one of "
+                '"text", "file" or "data"'
+            )
+
+    return None
+
+
+def invalid_argument_response(message: str) -> JSONResponse:
+    """Match the shape the v0.3 adapter uses for its own error responses."""
+    return JSONResponse(
+        {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": message}},
+        status_code=400,
+    )
+
+
+def request_with_json_body(request: Request, payload: Any) -> Request:
+    """Return the same request with a replaced, already-buffered JSON body."""
+    body = json.dumps(payload).encode()
+
+    async def receive() -> MutableMapping[str, Any]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = dict(request.scope)
+    scope["headers"] = [
+        (name, value)
+        for name, value in request.scope["headers"]
+        if name != b"content-length"
+    ] + [(b"content-length", str(len(body)).encode())]
+    return Request(scope, receive)
+
+
+def normalize_v0_3_message_body(
+    endpoint: Callable[[Request], Awaitable[Any]],
+) -> Callable[[Request], Awaitable[Any]]:
+    """Normalize the body before the SDK parses it; reject what it cannot fix.
+
+    The SDK parses with ignore_unknown_fields=True, so a wrong shape is dropped
+    silently: an unrecognised part leaves an empty Part, FromProto.part raises
+    ValueError, and the caller gets a 500 that names no field. Validate here so
+    a bad body returns 400 with the offending field instead.
+    """
+
+    async def endpoint_with_normalized_body(request: Request) -> Any:
+        raw_body = await request.body()
+        try:
+            payload = json.loads(raw_body) if raw_body else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return invalid_argument_response("body must be valid JSON")
+
+        normalized = normalize_v0_3_message_payload(payload)
+        error = describe_invalid_v0_3_message(normalized)
+        if error:
+            return invalid_argument_response(error)
+
+        if normalized != payload:
+            logger.info("Normalized a non-standard v0.3 message body.")
+            request = request_with_json_body(request, normalized)
+
+        return await endpoint(request)
+
+    return endpoint_with_normalized_body
+
+
 def add_v0_3_routes(
     app: FastAPI,
     request_handler: DefaultRequestHandler,
@@ -217,6 +377,8 @@ def add_v0_3_routes(
 
     adapter = REST03Adapter(http_handler=request_handler)
     for (path, method), endpoint in adapter.routes().items():
+        if path in V0_3_MESSAGE_PATHS:
+            endpoint = normalize_v0_3_message_body(endpoint)
         app.add_route(path, endpoint, methods=[method])
 
 
