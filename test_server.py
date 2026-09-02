@@ -551,16 +551,28 @@ class V03MessageNormalizationTests(unittest.TestCase):
         )
         self.assertNotIn("parts", normalized["message"])
 
-    def test_a_valid_body_is_left_unchanged(self):
-        payload = {
-            "message": {
-                "messageId": "m1",
-                "role": "ROLE_USER",
-                "content": [{"text": "hello"}],
-            }
+    def test_a_valid_message_is_left_unchanged(self):
+        message = {
+            "messageId": "m1",
+            "role": "ROLE_USER",
+            "content": [{"text": "hello"}],
         }
 
-        self.assertEqual(normalize_v0_3_message_payload(payload), payload)
+        normalized = normalize_v0_3_message_payload({"message": message})
+
+        self.assertEqual(normalized["message"], message)
+
+    def test_a_send_defaults_to_blocking(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(normalized["configuration"], {"blocking": True})
+
+    def test_an_explicit_blocking_choice_is_respected(self):
+        normalized = normalize_v0_3_message_payload(
+            {**CONNECTOR_MESSAGE_BODY, "configuration": {"blocking": False}}
+        )
+
+        self.assertEqual(normalized["configuration"], {"blocking": False})
 
     def test_describe_invalid_message_names_the_empty_content_list(self):
         self.assertEqual(
@@ -607,6 +619,20 @@ class V03MessageSendRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.received, ["latest US Open news"])
+
+    def test_send_response_already_carries_the_finished_answer(self):
+        task = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]
+
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(
+            task["status"]["message"]["content"],
+            [{"text": "Alcaraz won in four sets."}],
+        )
+        self.assertEqual(
+            task["artifacts"][0]["parts"], [{"text": "Alcaraz won in four sets."}]
+        )
 
     def test_unfixable_message_returns_400_naming_the_field(self):
         response = self.client.post("/v1/message:send", json={"message": {}})

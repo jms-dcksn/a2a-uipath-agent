@@ -287,12 +287,26 @@ def normalize_v0_3_message(message: Any) -> Any:
 
 
 def normalize_v0_3_message_payload(payload: Any) -> Any:
-    """Normalize the message inside a v0.3 send/stream request body."""
+    """Normalize the message inside a v0.3 send/stream request body.
+
+    Also ask for a blocking send. In v0.3 configuration.blocking defaults to
+    false, so a caller that sends no configuration gets an immediate
+    TASK_STATE_SUBMITTED and has to poll for the answer. The connector sends no
+    configuration, polls once about a second later, and accepts that
+    non-terminal task. Default to blocking so the answer rides back on the send
+    response itself and no poll is needed.
+    """
     if not isinstance(payload, dict) or "message" not in payload:
         return payload
 
     normalized = dict(payload)
     normalized["message"] = normalize_v0_3_message(payload["message"])
+
+    configuration = normalized.get("configuration")
+    configuration = dict(configuration) if isinstance(configuration, dict) else {}
+    configuration.setdefault("blocking", True)
+    normalized["configuration"] = configuration
+
     return normalized
 
 
