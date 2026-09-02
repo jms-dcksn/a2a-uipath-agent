@@ -7,13 +7,18 @@ from fastapi.testclient import TestClient
 
 from server import (
     DEFAULT_MODEL_NAME,
+    DEFAULT_TAVILY_MCP_SERVER_URL,
     ExternalAppTokenProvider,
     UiPathAgentExecutor,
     build_app,
+    build_mcp_servers,
+    build_tavily_mcp_server,
     build_chat_model,
     build_agent_card,
     build_token_provider_from_env,
+    describe_invalid_v0_3_message,
     is_unauthorized_error,
+    normalize_v0_3_message_payload,
     run_token_refresh_graph,
 )
 
@@ -494,6 +499,333 @@ class FakeRequestContext:
 
     def get_user_input(self):
         return self._user_input
+
+
+CONNECTOR_MESSAGE_BODY = {
+    "message": {
+        "capabilities": "uipath_web_search",
+        "content": ["latest US Open news"],
+    }
+}
+
+
+class McpServerSelectionTests(unittest.TestCase):
+    def test_tavily_is_absent_without_an_api_key(self):
+        servers = build_mcp_servers("token-1", environ={})
+
+        self.assertEqual([server.name for server in servers], ["uipath"])
+        self.assertTrue(servers[0].is_primary)
+        self.assertEqual(
+            servers[0].headers, {"Authorization": "Bearer token-1"}
+        )
+
+    def test_tavily_is_added_when_an_api_key_is_set(self):
+        servers = build_mcp_servers(
+            "token-1", environ={"TAVILY_API_KEY": "tvly-key"}
+        )
+
+        self.assertEqual([server.name for server in servers], ["uipath", "tavily"])
+        self.assertFalse(servers[1].is_primary)
+
+    def test_tavily_url_carries_the_api_key(self):
+        server = build_tavily_mcp_server({"TAVILY_API_KEY": "tvly-key"})
+
+        self.assertEqual(
+            server.url, f"{DEFAULT_TAVILY_MCP_SERVER_URL}?tavilyApiKey=tvly-key"
+        )
+
+    def test_a_tavily_url_override_with_a_query_string_is_left_alone(self):
+        server = build_tavily_mcp_server(
+            {
+                "TAVILY_API_KEY": "tvly-key",
+                "TAVILY_MCP_SERVER_URL": "https://example.test/mcp?token=abc",
+            }
+        )
+
+        self.assertEqual(server.url, "https://example.test/mcp?token=abc")
+
+
+class McpToolLoadingTests(unittest.IsolatedAsyncioTestCase):
+    """Degrade to the servers that answer, but let a primary 401 escape."""
+
+    class FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    async def _load(self, results):
+        """results maps a server name to its tool names, or to an exception."""
+        import contextlib
+        import sys
+        import types
+        from unittest.mock import patch
+
+        import server
+
+        @contextlib.asynccontextmanager
+        async def fake_client(*, url, headers, timeout):
+            yield (url, None, None)
+
+        class FakeSession:
+            def __init__(self, url):
+                self.url = url
+
+            async def initialize(self):
+                pass
+
+        @contextlib.asynccontextmanager
+        async def fake_client_session(read, write):
+            yield FakeSession(read)
+
+        async def fake_load_mcp_tools(session, *, server_name, tool_name_prefix):
+            outcome = results[server_name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return [McpToolLoadingTests.FakeTool(f"{server_name}_{n}") for n in outcome]
+
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.ClientSession = fake_client_session
+        http_module = types.ModuleType("mcp.client.streamable_http")
+        http_module.streamablehttp_client = fake_client
+        tools_module = types.ModuleType("langchain_mcp_adapters.tools")
+        tools_module.load_mcp_tools = fake_load_mcp_tools
+
+        servers = build_mcp_servers(
+            "token-1",
+            environ=(
+                {"TAVILY_API_KEY": "tvly-key"} if "tavily" in results else {}
+            ),
+        )
+        modules = {
+            "mcp": mcp_module,
+            "mcp.client.streamable_http": http_module,
+            "langchain_mcp_adapters.tools": tools_module,
+        }
+        with patch.dict(sys.modules, modules):
+            async with contextlib.AsyncExitStack() as stack:
+                return await server.load_tools_from_mcp_servers(stack, servers)
+
+    async def test_tools_from_both_servers_are_merged_and_prefixed(self):
+        tools = await self._load({"uipath": ["search"], "tavily": ["search"]})
+
+        self.assertEqual(
+            [tool.name for tool in tools], ["uipath_search", "tavily_search"]
+        )
+
+    async def test_a_broken_uipath_server_still_leaves_the_fallback(self):
+        tools = await self._load(
+            {"uipath": RuntimeError("MCP server exploded"), "tavily": ["search"]}
+        )
+
+        self.assertEqual([tool.name for tool in tools], ["tavily_search"])
+
+    async def test_a_broken_fallback_leaves_the_primary(self):
+        tools = await self._load(
+            {"uipath": ["search"], "tavily": RuntimeError("bad api key")}
+        )
+
+        self.assertEqual([tool.name for tool in tools], ["uipath_search"])
+
+    async def test_a_primary_401_propagates_for_the_token_refresh(self):
+        unauthorized = httpx.HTTPStatusError(
+            "unauthorized",
+            request=httpx.Request("POST", "https://example.test"),
+            response=httpx.Response(401),
+        )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self._load({"uipath": unauthorized, "tavily": ["search"]})
+
+    async def test_a_fallback_401_does_not_propagate(self):
+        unauthorized = httpx.HTTPStatusError(
+            "unauthorized",
+            request=httpx.Request("POST", "https://example.test"),
+            response=httpx.Response(401),
+        )
+
+        tools = await self._load({"uipath": ["search"], "tavily": unauthorized})
+
+        self.assertEqual([tool.name for tool in tools], ["uipath_search"])
+
+
+class V03MessageNormalizationTests(unittest.TestCase):
+    def test_bare_string_content_becomes_a_text_part(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(
+            normalized["message"]["content"],
+            [{"text": "latest US Open news"}],
+        )
+
+    def test_capabilities_is_kept_as_message_metadata(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(
+            normalized["message"]["metadata"],
+            {"capabilities": "uipath_web_search"},
+        )
+
+    def test_missing_role_defaults_to_user(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(normalized["message"]["role"], "ROLE_USER")
+
+    def test_missing_message_id_is_filled_in(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertTrue(normalized["message"]["messageId"])
+
+    def test_json_rpc_style_parts_and_role_are_translated(self):
+        normalized = normalize_v0_3_message_payload(
+            {
+                "message": {
+                    "messageId": "m1",
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "hello"}],
+                }
+            }
+        )
+
+        self.assertEqual(normalized["message"]["role"], "ROLE_USER")
+        self.assertEqual(
+            normalized["message"]["content"],
+            [{"kind": "text", "text": "hello"}],
+        )
+        self.assertNotIn("parts", normalized["message"])
+
+    def test_a_valid_message_is_left_unchanged(self):
+        message = {
+            "messageId": "m1",
+            "role": "ROLE_USER",
+            "content": [{"text": "hello"}],
+        }
+
+        normalized = normalize_v0_3_message_payload({"message": message})
+
+        self.assertEqual(normalized["message"], message)
+
+    def test_a_send_defaults_to_blocking(self):
+        normalized = normalize_v0_3_message_payload(CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(normalized["configuration"], {"blocking": True})
+
+    def test_an_explicit_blocking_choice_is_respected(self):
+        normalized = normalize_v0_3_message_payload(
+            {**CONNECTOR_MESSAGE_BODY, "configuration": {"blocking": False}}
+        )
+
+        self.assertEqual(normalized["configuration"], {"blocking": False})
+
+    def test_describe_invalid_message_names_the_empty_content_list(self):
+        self.assertEqual(
+            describe_invalid_v0_3_message({"message": {"content": []}}),
+            "message.content must be a non-empty list of parts",
+        )
+
+    def test_describe_invalid_message_names_the_offending_part(self):
+        self.assertEqual(
+            describe_invalid_v0_3_message(
+                {"message": {"content": [{"text": "ok"}, {"kind": "text"}]}}
+            ),
+            'message.content[1] must set one of "text", "file" or "data"',
+        )
+
+    def test_describe_invalid_message_accepts_a_valid_body(self):
+        self.assertIsNone(
+            describe_invalid_v0_3_message(
+                {"message": {"content": [{"text": "hello"}]}}
+            )
+        )
+
+
+class V03MessageSendRouteTests(unittest.TestCase):
+    """The v0.3 HTTP+JSON route the UiPath A2A connector actually calls."""
+
+    def setUp(self):
+        self.received = []
+
+        async def fake_agent_runner(user_input):
+            self.received.append(user_input)
+            return "Alcaraz won in four sets."
+
+        patcher = patch(
+            "server.UiPathAgentExecutor",
+            lambda: UiPathAgentExecutor(fake_agent_runner),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(build_app("127.0.0.1", 9999))
+
+    def test_connector_message_shape_reaches_the_agent(self):
+        response = self.client.post("/v1/message:send", json=CONNECTOR_MESSAGE_BODY)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.received, ["latest US Open news"])
+
+    def test_send_response_already_carries_the_finished_answer(self):
+        task = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]
+
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(
+            task["status"]["message"]["content"],
+            [{"text": "Alcaraz won in four sets."}],
+        )
+        self.assertEqual(
+            task["artifacts"][0]["parts"], [{"text": "Alcaraz won in four sets."}]
+        )
+
+    def test_unfixable_message_returns_400_naming_the_field(self):
+        response = self.client.post("/v1/message:send", json={"message": {}})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"],
+            "message.content must be a non-empty list of parts",
+        )
+
+    def test_malformed_json_returns_400(self):
+        response = self.client.post(
+            "/v1/message:send",
+            content=b"{not json",
+            headers={"content-type": "application/json"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_connector_task_poll_returns_the_completed_task(self):
+        task_id = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]["id"]
+
+        response = self.client.get(f"/v1/tasks:get?id={task_id}")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(
+            task["status"]["message"]["content"],
+            [{"text": "Alcaraz won in four sets."}],
+        )
+
+    def test_connector_task_poll_matches_the_resource_style_route(self):
+        task_id = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]["id"]
+
+        self.assertEqual(
+            self.client.get(f"/v1/tasks:get?id={task_id}").json(),
+            self.client.get(f"/v1/tasks/{task_id}").json(),
+        )
+
+    def test_task_poll_without_an_id_returns_400(self):
+        response = self.client.get("/v1/tasks:get")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"],
+            'query parameter "id" is required',
+        )
 
 
 if __name__ == "__main__":
