@@ -7,9 +7,12 @@ from fastapi.testclient import TestClient
 
 from server import (
     DEFAULT_MODEL_NAME,
+    DEFAULT_TAVILY_MCP_SERVER_URL,
     ExternalAppTokenProvider,
     UiPathAgentExecutor,
     build_app,
+    build_mcp_servers,
+    build_tavily_mcp_server,
     build_chat_model,
     build_agent_card,
     build_token_provider_from_env,
@@ -504,6 +507,144 @@ CONNECTOR_MESSAGE_BODY = {
         "content": ["latest US Open news"],
     }
 }
+
+
+class McpServerSelectionTests(unittest.TestCase):
+    def test_tavily_is_absent_without_an_api_key(self):
+        servers = build_mcp_servers("token-1", environ={})
+
+        self.assertEqual([server.name for server in servers], ["uipath"])
+        self.assertTrue(servers[0].is_primary)
+        self.assertEqual(
+            servers[0].headers, {"Authorization": "Bearer token-1"}
+        )
+
+    def test_tavily_is_added_when_an_api_key_is_set(self):
+        servers = build_mcp_servers(
+            "token-1", environ={"TAVILY_API_KEY": "tvly-key"}
+        )
+
+        self.assertEqual([server.name for server in servers], ["uipath", "tavily"])
+        self.assertFalse(servers[1].is_primary)
+
+    def test_tavily_url_carries_the_api_key(self):
+        server = build_tavily_mcp_server({"TAVILY_API_KEY": "tvly-key"})
+
+        self.assertEqual(
+            server.url, f"{DEFAULT_TAVILY_MCP_SERVER_URL}?tavilyApiKey=tvly-key"
+        )
+
+    def test_a_tavily_url_override_with_a_query_string_is_left_alone(self):
+        server = build_tavily_mcp_server(
+            {
+                "TAVILY_API_KEY": "tvly-key",
+                "TAVILY_MCP_SERVER_URL": "https://example.test/mcp?token=abc",
+            }
+        )
+
+        self.assertEqual(server.url, "https://example.test/mcp?token=abc")
+
+
+class McpToolLoadingTests(unittest.IsolatedAsyncioTestCase):
+    """Degrade to the servers that answer, but let a primary 401 escape."""
+
+    class FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    async def _load(self, results):
+        """results maps a server name to its tool names, or to an exception."""
+        import contextlib
+        import sys
+        import types
+        from unittest.mock import patch
+
+        import server
+
+        @contextlib.asynccontextmanager
+        async def fake_client(*, url, headers, timeout):
+            yield (url, None, None)
+
+        class FakeSession:
+            def __init__(self, url):
+                self.url = url
+
+            async def initialize(self):
+                pass
+
+        @contextlib.asynccontextmanager
+        async def fake_client_session(read, write):
+            yield FakeSession(read)
+
+        async def fake_load_mcp_tools(session, *, server_name, tool_name_prefix):
+            outcome = results[server_name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return [McpToolLoadingTests.FakeTool(f"{server_name}_{n}") for n in outcome]
+
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.ClientSession = fake_client_session
+        http_module = types.ModuleType("mcp.client.streamable_http")
+        http_module.streamablehttp_client = fake_client
+        tools_module = types.ModuleType("langchain_mcp_adapters.tools")
+        tools_module.load_mcp_tools = fake_load_mcp_tools
+
+        servers = build_mcp_servers(
+            "token-1",
+            environ=(
+                {"TAVILY_API_KEY": "tvly-key"} if "tavily" in results else {}
+            ),
+        )
+        modules = {
+            "mcp": mcp_module,
+            "mcp.client.streamable_http": http_module,
+            "langchain_mcp_adapters.tools": tools_module,
+        }
+        with patch.dict(sys.modules, modules):
+            async with contextlib.AsyncExitStack() as stack:
+                return await server.load_tools_from_mcp_servers(stack, servers)
+
+    async def test_tools_from_both_servers_are_merged_and_prefixed(self):
+        tools = await self._load({"uipath": ["search"], "tavily": ["search"]})
+
+        self.assertEqual(
+            [tool.name for tool in tools], ["uipath_search", "tavily_search"]
+        )
+
+    async def test_a_broken_uipath_server_still_leaves_the_fallback(self):
+        tools = await self._load(
+            {"uipath": RuntimeError("MCP server exploded"), "tavily": ["search"]}
+        )
+
+        self.assertEqual([tool.name for tool in tools], ["tavily_search"])
+
+    async def test_a_broken_fallback_leaves_the_primary(self):
+        tools = await self._load(
+            {"uipath": ["search"], "tavily": RuntimeError("bad api key")}
+        )
+
+        self.assertEqual([tool.name for tool in tools], ["uipath_search"])
+
+    async def test_a_primary_401_propagates_for_the_token_refresh(self):
+        unauthorized = httpx.HTTPStatusError(
+            "unauthorized",
+            request=httpx.Request("POST", "https://example.test"),
+            response=httpx.Response(401),
+        )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self._load({"uipath": unauthorized, "tavily": ["search"]})
+
+    async def test_a_fallback_401_does_not_propagate(self):
+        unauthorized = httpx.HTTPStatusError(
+            "unauthorized",
+            request=httpx.Request("POST", "https://example.test"),
+            response=httpx.Response(401),
+        )
+
+        tools = await self._load({"uipath": ["search"], "tavily": unauthorized})
+
+        self.assertEqual([tool.name for tool in tools], ["uipath_search"])
 
 
 class V03MessageNormalizationTests(unittest.TestCase):

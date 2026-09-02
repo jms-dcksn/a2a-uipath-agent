@@ -15,7 +15,7 @@ import os
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable, MutableMapping
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 import httpx
 import uvicorn
@@ -70,11 +70,19 @@ DEFAULT_MCP_SERVER_URL = (
     "https://staging.uipath.com/uipathlabs/Playground/agenthub_/mcp/"
     "e072bd13-1c37-4125-a891-fde9bf3d7311/coded-web-search-server"
 )
+DEFAULT_TAVILY_MCP_SERVER_URL = "https://mcp.tavily.com/mcp/"
 DEFAULT_MODEL_NAME = "gpt-4.1-mini-2025-04-14"
+# Tool names are prefixed with the server they came from, so the prompt can
+# name the primary path and the fallback path.
+UIPATH_SERVER_NAME = "uipath"
+TAVILY_SERVER_NAME = "tavily"
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant. Use the available UiPath MCP tools when web "
-    "search would improve the answer. Keep answers concise and cite sources "
-    "returned by the tool when they are available."
+    "You are a research assistant with web search tools. Always search before "
+    "you answer; never answer from memory. Search with the uipath_ tools "
+    "first. If a uipath_ tool returns an error, returns no results, or is not "
+    "in your tool list, run the same search again with the tavily_ tools. "
+    "Name the tool that produced the answer, keep the answer concise, and "
+    "cite the source URLs the tool returned."
 )
 A2A_PROTECTED_PATH_PREFIXES = ("/a2a/jsonrpc", "/a2a/rest", "/v1")
 A2A_BEARER_SCHEME_NAME = "bearerAuth"
@@ -516,7 +524,112 @@ async def run_token_refresh_graph(
     return result["result"]
 
 
-async def call_uipath_mcp_agent(
+class McpServer(NamedTuple):
+    """One MCP server to merge tools from.
+
+    `is_primary` marks the server whose 401 must reach the token-refresh graph.
+    Any other failure from any server is swallowed so the remaining servers
+    still supply tools.
+    """
+
+    name: str
+    url: str
+    headers: dict[str, str]
+    is_primary: bool = False
+
+
+def build_tavily_mcp_server(
+    environ: MutableMapping[str, str] | None = None,
+) -> McpServer | None:
+    """Describe the Tavily fallback server, or None when no key is configured."""
+    environ = environ if environ is not None else os.environ
+    api_key = environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return None
+
+    base_url = environ.get(
+        "TAVILY_MCP_SERVER_URL", DEFAULT_TAVILY_MCP_SERVER_URL
+    )
+    # Tavily's hosted MCP server takes the key on the query string. An override
+    # that already carries its own query string is left alone, so a changed
+    # contract is a config change rather than a code change.
+    url = base_url if "?" in base_url else f"{base_url}?tavilyApiKey={api_key}"
+    return McpServer(name=TAVILY_SERVER_NAME, url=url, headers={})
+
+
+def build_mcp_servers(
+    access_token: str,
+    *,
+    uipath_mcp_server_url: str | None = None,
+    environ: MutableMapping[str, str] | None = None,
+) -> list[McpServer]:
+    """The UiPath search server first, then the Tavily fallback if configured."""
+    environ = environ if environ is not None else os.environ
+    servers = [
+        McpServer(
+            name=UIPATH_SERVER_NAME,
+            url=uipath_mcp_server_url
+            or environ.get("UIPATH_MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL),
+            headers={"Authorization": f"Bearer {access_token}"},
+            is_primary=True,
+        )
+    ]
+
+    tavily_server = build_tavily_mcp_server(environ)
+    if tavily_server:
+        servers.append(tavily_server)
+    else:
+        logger.info("TAVILY_API_KEY is not set; running without the fallback.")
+
+    return servers
+
+
+async def load_tools_from_mcp_servers(
+    stack: contextlib.AsyncExitStack,
+    servers: list[McpServer],
+) -> list[Any]:
+    """Merge the tools of every server that answers, prefixed by server name."""
+    from langchain_mcp_adapters.tools import load_mcp_tools
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    tools: list[Any] = []
+    for server in servers:
+        try:
+            read, write, _ = await stack.enter_async_context(
+                streamablehttp_client(
+                    url=server.url, headers=server.headers, timeout=60
+                )
+            )
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            server_tools = await load_mcp_tools(
+                session,
+                server_name=server.name,
+                tool_name_prefix=True,
+            )
+        except BaseException as error:
+            # A 401 from the primary is the signal the token-refresh graph
+            # waits for. Everything else degrades to the remaining servers.
+            if server.is_primary and is_unauthorized_error(error):
+                raise
+            logger.warning(
+                "No tools from the %s MCP server: %s", server.name, error
+            )
+            continue
+
+        logger.info(
+            "Loaded %d tools from %s: %s",
+            len(server_tools),
+            server.name,
+            [tool.name for tool in server_tools],
+        )
+        tools.extend(server_tools)
+
+    return tools
+
+
+async def call_web_search_agent(
     task: str,
     access_token: str,
     *,
@@ -525,47 +638,44 @@ async def call_uipath_mcp_agent(
     system_prompt: str | None = None,
 ) -> str:
     from langchain.agents import create_agent
-    from langchain_mcp_adapters.tools import load_mcp_tools
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
     try:
         from langchain.messages import HumanMessage, SystemMessage
     except ImportError:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-    resolved_mcp_url = mcp_server_url or os.getenv(
-        "UIPATH_MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
-    )
     resolved_model_name = model_name or os.getenv(
         "UIPATH_AGENT_MODEL", DEFAULT_MODEL_NAME
     )
     resolved_system_prompt = system_prompt or os.getenv(
         "UIPATH_AGENT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT
     )
+    servers = build_mcp_servers(
+        access_token, uipath_mcp_server_url=mcp_server_url
+    )
 
-    async with streamablehttp_client(
-        url=resolved_mcp_url,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=60,
-    ) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools = await load_mcp_tools(session)
-            model = build_chat_model(
-                model_name=resolved_model_name,
-                access_token=access_token,
+    async with contextlib.AsyncExitStack() as stack:
+        tools = await load_tools_from_mcp_servers(stack, servers)
+        if not tools:
+            raise RuntimeError(
+                "No web search tools available. Every configured MCP server "
+                f"failed: {', '.join(server.name for server in servers)}."
             )
-            agent = create_agent(model, tools=tools)
-            response = await agent.ainvoke(
-                {
-                    "messages": [
-                        SystemMessage(content=resolved_system_prompt),
-                        HumanMessage(content=task),
-                    ]
-                }
-            )
-            return _last_message_content(response)
+
+        model = build_chat_model(
+            model_name=resolved_model_name,
+            access_token=access_token,
+        )
+        agent = create_agent(model, tools=tools)
+        response = await agent.ainvoke(
+            {
+                "messages": [
+                    SystemMessage(content=resolved_system_prompt),
+                    HumanMessage(content=task),
+                ]
+            }
+        )
+        return _last_message_content(response)
 
 
 def _last_message_content(response: Any) -> str:
@@ -605,7 +715,7 @@ async def invoke_uipath_agent(user_input: str) -> str:
     return await run_token_refresh_graph(
         task=user_input,
         token_provider=token_provider,
-        agent_call=call_uipath_mcp_agent,
+        agent_call=call_web_search_agent,
     )
 
 
