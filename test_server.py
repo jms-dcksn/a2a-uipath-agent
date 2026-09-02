@@ -626,6 +626,40 @@ class V03MessageSendRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_connector_task_poll_returns_the_completed_task(self):
+        task_id = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]["id"]
+
+        response = self.client.get(f"/v1/tasks:get?id={task_id}")
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(
+            task["status"]["message"]["content"],
+            [{"text": "Alcaraz won in four sets."}],
+        )
+
+    def test_connector_task_poll_matches_the_resource_style_route(self):
+        task_id = self.client.post(
+            "/v1/message:send", json=CONNECTOR_MESSAGE_BODY
+        ).json()["task"]["id"]
+
+        self.assertEqual(
+            self.client.get(f"/v1/tasks:get?id={task_id}").json(),
+            self.client.get(f"/v1/tasks/{task_id}").json(),
+        )
+
+    def test_task_poll_without_an_id_returns_400(self):
+        response = self.client.get("/v1/tasks:get")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"],
+            'query parameter "id" is required',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

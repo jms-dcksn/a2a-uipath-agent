@@ -84,6 +84,17 @@ A2A_BEARER_SCHEME_NAME = "bearerAuth"
 V0_3_MESSAGE_PATHS = ("/v1/message:send", "/v1/message:stream")
 # A v0.3 Part is a oneof; exactly one of these keys carries the payload.
 PART_CONTENT_KEYS = ("text", "file", "data")
+# message:send returns as soon as the task is submitted, so the connector polls
+# for the result. It polls the gRPC-transcoding custom-method spelling,
+# GET /v1/tasks:get?id=<task id>. The SDK mounts only the resource spelling,
+# GET /v1/tasks/{id}, so the poll hit no route at all and returned FastAPI's
+# own 404 forever. Serve both spellings from the same handler.
+V0_3_TASK_ALIASES = {
+    ("/v1/tasks/{id}", "GET"): "/v1/tasks:get",
+    ("/v1/tasks/{id}:cancel", "POST"): "/v1/tasks:cancel",
+    ("/v1/tasks/{id}:subscribe", "GET"): "/v1/tasks:subscribe",
+    ("/v1/tasks/{id}:subscribe", "POST"): "/v1/tasks:subscribe",
+}
 # Protobuf JSON wants the enum name. Accept the spellings other A2A bindings
 # and older clients use.
 ROLE_ALIASES = {
@@ -366,6 +377,23 @@ def normalize_v0_3_message_body(
     return endpoint_with_normalized_body
 
 
+def read_task_id_from_query(
+    endpoint: Callable[[Request], Awaitable[Any]],
+) -> Callable[[Request], Awaitable[Any]]:
+    """Feed a /v1/tasks:<verb>?id=... request to the /v1/tasks/{id} handler."""
+
+    async def endpoint_with_task_id_path_param(request: Request) -> Any:
+        task_id = request.query_params.get("id")
+        if not task_id:
+            return invalid_argument_response('query parameter "id" is required')
+
+        scope = dict(request.scope)
+        scope["path_params"] = {"id": task_id}
+        return await endpoint(Request(scope, request.receive))
+
+    return endpoint_with_task_id_path_param
+
+
 def add_v0_3_routes(
     app: FastAPI,
     request_handler: DefaultRequestHandler,
@@ -380,6 +408,14 @@ def add_v0_3_routes(
         if path in V0_3_MESSAGE_PATHS:
             endpoint = normalize_v0_3_message_body(endpoint)
         app.add_route(path, endpoint, methods=[method])
+
+        alias_path = V0_3_TASK_ALIASES.get((path, method))
+        if alias_path:
+            app.add_route(
+                alias_path,
+                read_task_id_from_query(endpoint),
+                methods=[method],
+            )
 
 
 def is_unauthorized_error(error: BaseException) -> bool:
@@ -624,7 +660,11 @@ class UiPathAgentExecutor(AgentExecutor):
         await updater.add_artifact(
             parts=[Part(text=result)], name="response", last_chunk=True
         )
-        await updater.complete()
+        # Carry the answer on the final status too. A polling client reads the
+        # terminal task, and not every client looks inside task.artifacts.
+        await updater.complete(
+            message=updater.new_agent_message(parts=[Part(text=result)])
+        )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
